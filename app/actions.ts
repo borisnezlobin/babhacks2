@@ -6,12 +6,18 @@ import { z } from "zod";
 import { supabaseServer } from "@/lib/supabase/server";
 import { appOrigin, authConfigured, agentLinksConfigured } from "@/lib/config";
 import { ensureBuyer } from "@/lib/buyer/profile";
-import { requireOwner, resolveAgent } from "@/lib/buyer/auth";
+import {
+  endAgentSession,
+  redeemConnectionToken,
+  requireOwner,
+  resolveAgent,
+} from "@/lib/buyer/auth";
 import { approveRequest, declineRequest } from "@/lib/buyer/approvals";
 import { IntegrationUnavailable, InvalidOrder } from "@/lib/errors";
 import {
+  AGENT_CONNECT_SECONDS,
   AGENT_COOKIE,
-  AGENT_LINK_SECONDS,
+  AGENT_SESSION_SECONDS,
   hashAgentToken,
   newAgentToken,
   safeNext,
@@ -112,6 +118,9 @@ export async function signUp(form: FormData) {
 }
 export async function signOut() {
   const jar = await cookies();
+  // An agent that signs out ends its session for good, not just in this browser.
+  const agentToken = jar.get(AGENT_COOKIE)?.value;
+  if (agentToken) await endAgentSession(agentToken);
   jar.delete(AGENT_COOKIE);
   jar.delete({ name: "payments-new-agent-link", path: "/account" });
   if (authConfigured()) await (await supabaseServer()).auth.signOut();
@@ -120,7 +129,7 @@ export async function signOut() {
 export async function createAgentLink() {
   const owner = await requireOwner();
   if (!agentLinksConfigured())
-    fail("/account", "Agent links are not configured yet.");
+    fail("/account", "Agent connections are not configured yet.");
   const token = newAgentToken();
   const supabase = await supabaseServer();
   const { error } = await supabase.from("track_c_agent_links").upsert(
@@ -128,7 +137,7 @@ export async function createAgentLink() {
       buyer_id: owner.buyerId,
       token_hash: hashAgentToken(token),
       expires_at: new Date(
-        Date.now() + AGENT_LINK_SECONDS * 1000,
+        Date.now() + AGENT_CONNECT_SECONDS * 1000,
       ).toISOString(),
       created_at: new Date().toISOString(),
     },
@@ -137,56 +146,62 @@ export async function createAgentLink() {
   if (error)
     fail(
       "/account",
-      "Could not create the agent link. Check that the Track C database setup is complete.",
+      "Could not create a connection token. Check that the Track C database setup is complete.",
     );
-  // Shown briefly only to the signed-in owner. Only its hash is stored in the DB.
+  // Shown only to the signed-in owner while it can still be used. Only its hash is stored in the DB.
   (await cookies()).set("payments-new-agent-link", token, {
     httpOnly: true,
     secure: secure(),
     sameSite: "strict",
     path: "/account",
-    maxAge: 120,
+    maxAge: AGENT_CONNECT_SECONDS,
   });
   redirect("/account#agent-link");
 }
+// Ends the agent's session and any connection token it hasn't used yet.
+// The token goes first. A redemption racing this either finishes before the
+// session delete or finds no token. Either way no session survives a Disconnect.
 export async function revokeAgentLink() {
   const owner = await requireOwner();
-  const { error } = await (await supabaseServer())
-    .from("track_c_agent_links")
-    .delete()
-    .eq("buyer_id", owner.buyerId);
-  if (error)
-    fail("/account", "Could not revoke the agent link. Please try again.");
+  const supabase = await supabaseServer();
+  for (const table of ["track_c_agent_links", "track_c_agent_sessions"]) {
+    const { error } = await supabase
+      .from(table)
+      .delete()
+      .eq("buyer_id", owner.buyerId);
+    if (error)
+      fail("/account", "Could not disconnect your agent. Please try again.");
+  }
   (await cookies()).delete({
     name: "payments-new-agent-link",
     path: "/account",
   });
   redirect("/account?notice=revoked#agent-link");
 }
-// Both connect paths share one session setup. The token never goes into a URL or a log.
-async function startAgentSession(token: string, failPath: string) {
-  if (!(await resolveAgent(token))) redirect(failPath);
-  (await cookies()).set(AGENT_COOKIE, token, {
+// Used by /agents/connect, where an agent pastes its access token into a form.
+// It uses up the one-time connection token and gives the agent's browser a
+// separate session token. Neither token goes into a URL or a log.
+export async function connectAgentWithToken(form: FormData) {
+  const jar = await cookies();
+  // A browser that is already connected can only reconnect to the same
+  // account. A token planted on a web page can't move the agent elsewhere.
+  const current = jar.get(AGENT_COOKIE)?.value;
+  const currentBuyer = current
+    ? (await resolveAgent(current))?.buyerId
+    : undefined;
+  const session = await redeemConnectionToken(
+    String(form.get("token") || "").trim(),
+    currentBuyer,
+  );
+  if (!session) redirect("/agents/connect?error=invalid");
+  jar.set(AGENT_COOKIE, session.token, {
     httpOnly: true,
     secure: secure(),
     sameSite: "lax",
     path: "/",
-    maxAge: AGENT_LINK_SECONDS,
+    maxAge: AGENT_SESSION_SECONDS,
   });
   redirect("/shops?notice=connected");
-}
-export async function connectAgent(form: FormData) {
-  await startAgentSession(
-    String(form.get("token") || ""),
-    "/agents?error=expired",
-  );
-}
-// Used by /agents/connect, where an agent pastes its access token into a form.
-export async function connectAgentWithToken(form: FormData) {
-  await startAgentSession(
-    String(form.get("token") || "").trim(),
-    "/agents/connect?error=invalid",
-  );
 }
 const requestId = (form: FormData) => {
   const parsed = z.string().uuid().safeParse(form.get("requestId"));
